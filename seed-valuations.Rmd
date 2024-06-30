@@ -1,0 +1,2018 @@
+```{python}
+import os
+import importlib
+os.chdir("/Users/nnamdi/Programming/seed-valuations/")
+
+from smoothlp import *
+```
+
+```{r}
+library(fastverse)
+library(readxl)
+library(ggplot2)
+library(hrbrthemes)
+library(roll)
+library(zoo)
+library(lubridate)
+library(fredr)
+library(stringr)
+library(fixest)
+library(patchwork)
+source("BoostedHP.R")
+```
+
+```{r}
+theme_whoisnnamdi <- theme_ft_rc() +
+    theme(
+      legend.text  = element_text(size = 16, color = "white"),
+      legend.title = element_text(size = 16),
+      legend.margin = margin(t = -10),
+      plot.title   = element_text(size = 32, color = "white"),
+      plot.subtitle = element_text(size = 16, color = "white"),
+      plot.caption = element_text(size = 14, color = "white"),
+      axis.line    = element_line(color= "white"),
+      axis.title.x = element_text(size = 14, color = "white"),
+      axis.title.y = element_text(size = 14, color = "white"),
+      axis.text.x = element_text(size = 14, color = "white"),
+      axis.text.y = element_text(size = 14, color = "white"),
+      strip.text.x = element_text(size = 14, color = "white"),
+      panel.spacing.y = unit(0.5, "lines"),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.minor.y = element_blank(),
+      panel.grid.major.x = element_blank(),
+      panel.grid.major.y = element_blank()
+    )
+
+scheme <- c("#f8766d", "#00bfc4", "#00ba38")
+```
+
+```{r}
+reg <- function(formula, data) {
+  feols(formula, data, panel.id = ~series + period, vcov = "NW")
+}
+
+# geom_hp <- function(x, y, type = "trend", ...) {
+#   y <- BoostedHP(y, stopping = "BIC")[[type]]
+#   
+#   geom_line(aes(x=x, y=y), ...)
+# }
+# 
+# FUN_filter <- function(y) {
+#   as.numeric(StructTS(y, type = "trend")$fitted[, 1])
+# }
+```
+
+```{r}
+#Pitchbook search: https://content.pitchbook.com/share/quick-link/search/cf7a10d6-4bdf-43fd-8fdb-9be0febbdbac?hash=7fff7e210dc6b563002be19ba612d61aa7fddc24b1e650ef78cfc8b54dbdb4b9
+data <- data.table(read_excel("PitchBook_Deal_Pivot_Table_2024_02_17_20_30_16.xlsx", sheet = 1, skip = 7))
+data <- data[, c(1:3, 5:7)]
+data <- data[1:(which(data$Year == "All") - 1)]
+data <- data[, Year := zoo::na.locf(Year, na.rm = FALSE)]
+data <- data[, Quarter := zoo::na.locf(Quarter, na.rm = FALSE)]
+setnames(data, c("year", "quarter", "series", "deals", "capital", "valuation"))
+data <- data[year != "All"]
+data <- data[quarter != "All"]
+#data <- data[!series %in% c("All", "Series H", "Series I", "Series J", "Series K")]
+data <- data[!series %in% c("All", "Series E", "Series F", "Series G", "Series H", "Series I", "Series J", "Series K")]
+data[, valuation := as.numeric(valuation) * deals]
+data <- na.omit(data)
+#data[series %in% c("Series D", "Series E", "Series F", "Series G"), series := "Series D+"]
+data <- data[, lapply(.SD, sum), .SDcols = c("deals", "capital", "valuation"), by = .(year, quarter, series)]
+data[, dilution  := capital / valuation]
+data[, valuation := valuation / deals]
+setorder(data, year, quarter, series)
+data[, period := paste(year, quarter)]
+mod_cols = c("deals", "capital", "valuation", "dilution")
+
+edits <- data.table(
+  company = c("Waymo", "Canva", "Yuga Labs", "Binance.US", "Aptos Labs"),
+  period = c("2020 2Q", "2020 2Q", "2022 1Q", "2022 1Q", "2022 1Q"),
+  series = c("Series A", "Series A", "Seed", "Seed", "Seed"),
+  size = c(3000, 60, 449.99, 216.77, 200),
+  valuation = c(30000, 5910, 4000, 4500, 1000)
+)
+
+for (i in 1:length(edits)) {
+  data[period == edits$period[i] & series == edits$series[i], valuation := (valuation * deals - edits$valuation[i]) / (deals - 1)]
+  data[period == edits$period[i] & series == edits$series[i], deals := deals - 1]
+  data[period == edits$period[i] & series == edits$series[i], capital := capital - edits$size[i]]
+  data[period == edits$period[i] & series == edits$series[i], dilution := capital / valuation / deals]
+}
+
+data[, paste0(mod_cols, "_l") := lapply(.SD, log), .SDcols = mod_cols]
+data[, paste0(mod_cols, "_ld") := lapply(.SD, \(x) log(x) - log(shift(x, 1))), .SDcols = mod_cols, by = .(series)]
+data[, paste0(mod_cols, "_ldd") := lapply(.SD, \(x) (log(x) - log(shift(x, 1))) - (log(shift(x, 1)) - log(shift(x, 2)))), .SDcols = mod_cols, by = .(series)]
+data[, deals_adj_l := deals_l + dilution_l]
+data[, paste0(c("deals_adj_l"), "_ld") := lapply(.SD, \(x) x - shift(x, 1)), .SDcols = c("deals_adj_l"), by = .(series)]
+data[, date := as.Date(as.yearqtr(period, "%Y %q"))]
+data[, t := as.numeric(time(deals)), by = series]
+
+data
+```
+
+```{r}
+data[, deals_s := as.numeric(seasonal::seas(ts(deals, start=c(2010, 1), frequency = 4))$data[, "final"]), by = series]
+data[, deals_sl := as.numeric(log(seasonal::seas(ts(deals, start=c(2010, 1), frequency = 4))$data[, "final"])), by = series]
+data[, deals_sld := deals_sl - shift(deals_sl), by = series]
+
+data[, capital_s := as.numeric(seasonal::seas(ts(capital, start=c(2010, 1), frequency = 4))$data[, "final"]), by = series]
+data[, capital_sl := as.numeric(log(seasonal::seas(ts(capital, start=c(2010, 1), frequency = 4))$data[, "final"])), by = series]
+data[, capital_sld := capital_sl - shift(capital_sl), by = series]
+
+data[, deals_sll := predict(loess(deals_sl ~ t, data = .SD, span = 0.15)), by = series]
+data[, deals_slld := deals_sll - shift(deals_sll), by = series]
+
+data[, valuation_ll := predict(loess(valuation_l ~ t, data = .SD, span = 0.15)), by = series]
+data[, valuation_lld := valuation_ll - shift(valuation_ll), by = series]
+
+data[, dilution_ll := capital_sl - deals_sl - valuation_ll]
+data[, dilution_lld := dilution_ll - shift(dilution_ll), by = series]
+
+data[, capital_sll := predict(loess(capital_sl ~ t, data = .SD, span = 0.15)), by = series]
+data[, capital_slld := capital_sll - shift(capital_sll), by = series]
+```
+
+```{r}
+vol <- ggplot(cbind(
+  rbind(
+    data[, sd(na.omit(valuation_lld)), by = series],
+    data[t <= 40, sd(na.omit(valuation_lld)), by = series]
+  ),
+  period = c(rep("2010-2024", 5), rep("2010-2019", 5))
+)) +
+  geom_bar(aes(x = series, y = V1), fill = scheme[1], color = scheme[1], alpha = 0.5, stat = "identity", linewidth = 0.75, width = 0.75) +
+  geom_label(aes(x = series, y = V1, label=scales::percent(round(V1, 2))), 
+                       nudge_y = 0.015,
+                       color="white", 
+                       fill=scheme[1], 
+                       fontface="bold",
+                       label.size=NA) +
+  facet_wrap(~period, scales = "free") +
+  scale_y_continuous(
+    labels = scales::percent_format(scale = 100),
+    breaks = seq(0, 0.2, 0.05),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(
+    ylim = c(0, 0.2)
+  ) +
+  labs(
+    title = "Smol Vol",
+    subtitle = "Quarterly Valuation Volatilty",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = NULL,
+    y = "Volatility"
+  ) +
+  theme_whoisnnamdi
+
+vol
+```
+
+```{r}
+ggsave(dpi = "retina", plot = vol,   "vol.png",   width = 9, height = 6, units = "in")
+```
+
+```{r}
+sticky <- ggplot(data) +
+  geom_line(aes(x = date, y = valuation_ll), color = scheme[1]) +
+  geom_smooth(aes(x = date, y = valuation_ll), method = "loess", se = FALSE, formula = "y ~ x", span = 1.5, linewidth = 0.5, color = scheme[2], linetype = "dashed") +
+  facet_wrap(~series, scales = "free") +
+  scale_x_date(
+    date_labels = "%Y",
+    breaks = seq.Date(as.Date("2010/01/01"), as.Date("2023/03/31"), "5 year"),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    #labels = scales::percent_format(scale = 100),
+    #breaks = seq(-0.3, 0.1, 0.1),
+    expand = c(0, 0)
+  ) +
+  # coord_cartesian(
+  #   ylim = c(-0.3, 0.1)
+  # ) +
+  labs(
+    title = "Sticky Seeds",
+    subtitle = "Valuations Relative to Trend",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = NULL,
+    y = "Log Valuation"
+  ) +
+  theme_whoisnnamdi
+
+sticky
+
+# ggplot(data) +
+#   geom_line(aes(x = date, y = valuation_ll, color = series)) +
+#   geom_smooth(aes(x = date, y = valuation_ll, color = series), method = "loess", se = FALSE, formula = "y ~ x", span = 1.5, linewidth = 0.5, linetype = "dashed") +
+#   #facet_wrap(~series, scales = "free") +
+#   scale_x_date(
+#     date_labels = "%Y",
+#     breaks = seq.Date(as.Date("2010/01/01"), as.Date("2023/03/31"), "2 year"),
+#     expand = c(0, 0)
+#   ) +
+#   scale_y_continuous(
+#     #labels = scales::percent_format(scale = 100),
+#     breaks = seq(1, 9, 1),
+#     #expand = c(0, 0)
+#   ) +
+#   coord_cartesian(
+#     ylim = c(1, 8)
+#   ) +
+#   labs(
+#     title = "Sticky Seeds",
+#     subtitle = "Valuations Relative to Trend",
+#     caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+#     x = NULL,
+#     y = "Log Valuation"
+#   ) +
+#   theme_whoisnnamdi +
+#   theme(
+#     legend.title = element_blank(),
+#     legend.position = c(0.125, 0.7),
+#   )
+```
+
+```{r}
+ggsave(dpi = "retina", plot = sticky,   "sticky.png",   width = 9, height = 6, units = "in")
+```
+
+```{r}
+cbs <- ggplot(data[series == "Seed"]) +
+  geom_line(aes(x = date, y = valuation_ll - first(valuation_ll), color = "Seed Valuations")) +
+  geom_line(aes(x = date, y = eci_l - first(eci_l), color = "Tech Employment Cost Index (ECI)")) +
+  geom_line(
+    aes(
+      x = date, 
+      y = predict(lm(
+        valuation_ll ~ eci_l, 
+        data = data[series == "Seed"][t <= 40]), 
+        newdata = data[series == "Seed"]
+      ) - first(valuation_ll),
+      color = "ECI Predicted Seed Valuations"
+    ), linetype = "dashed") +
+  scale_x_date(
+    date_labels = "%Y",
+    breaks = seq.Date(as.Date("2010/01/01"), as.Date("2023/03/31"), "2 year"),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    #labels = scales::percent_format(scale = 100),
+    breaks = seq(0, 1.5, 0.5),
+    expand = c(0, 0)
+  ) +
+  scale_color_manual(
+    breaks = c("Seed Valuations", "Tech Employment Cost Index (ECI)", "ECI Predicted Seed Valuations"),
+    values = c(scheme[1], scheme[2], scheme[2])
+  ) +
+  # coord_cartesian(
+  #   ylim = c(-0.3, 0.1)
+  # ) +
+  labs(
+    title = "Compensation-Based Stocks",
+    subtitle = "Growth in Seed Valuations vs. Tech Employment Cost Index",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = NULL,
+    y = "Log Growth"
+  ) +
+  theme_whoisnnamdi +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.25, 0.85),
+  )
+
+cbs
+```
+
+```{r}
+ggsave(dpi = "retina", plot = cbs,   "cbs.png",   width = 9, height = 6, units = "in")
+```
+
+```{r}
+stage = "Series D"
+
+ggplot(data[series == stage]) +
+  geom_line(aes(x = date, y = valuation_ll - first(valuation_ll), color = "Seed Valuations")) +
+  geom_line(aes(x = date, y = eci_l - first(eci_l), color = "Tech Employment Cost Index (ECI)")) +
+  geom_line(
+    aes(
+      x = date, 
+      y = predict(lm(
+        valuation_ll ~ eci_l, 
+        data = data[series == stage][t <= 40]), 
+        newdata = data[series == stage]
+      ) - first(valuation_ll),
+      color = "ECI Predicted Seed Valuations"
+    ), linetype = "dashed") +
+  scale_x_date(
+    date_labels = "%Y",
+    breaks = seq.Date(as.Date("2010/01/01"), as.Date("2023/03/31"), "2 year"),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    #labels = scales::percent_format(scale = 100),
+    breaks = seq(0, 1.5, 0.5),
+    expand = c(0, 0)
+  ) +
+  scale_color_manual(
+    breaks = c("Seed Valuations", "Tech Employment Cost Index (ECI)", "ECI Predicted Seed Valuations"),
+    values = c(scheme[1], scheme[2], scheme[2])
+  ) +
+  # coord_cartesian(
+  #   ylim = c(-0.3, 0.1)
+  # ) +
+  labs(
+    title = "Compensation-Based Stocks",
+    subtitle = "Growth in Seed Valuations vs. Tech Employment Cost Index",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = NULL,
+    y = "Log Growth"
+  ) +
+  theme_whoisnnamdi +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.25, 0.85),
+  )
+```
+
+```{r}
+#library(googlesheets4)
+brw <- data.table(read_excel("BRW shock series 2023SEP.xlsx"))
+brw[, c("Year", "MonthNum") := tstrsplit(Month, "m", type.convert = TRUE)]
+brw[, MonthNum := as.numeric(MonthNum)]
+brw[, Quarter := ceiling(MonthNum / 3)]
+brw[, shocks := .(total_brw = sum(BRW...2)), by = .(Year, Quarter)]
+brw <- brw[, mean(shocks), by = .(Year, Quarter)]
+setnames(brw, "V1", "shocks")
+brw
+```
+
+```{r}
+for (stage in unique(data$series)) {
+  dols <- feols(c(valuation_lc, deals_slc) ~ capital_slc + f(capital_slcd, -4:4), data = data[series == stage], panel.id = ~series + period, vcov = "hetero")
+
+  summary(dols)
+  
+  data[series == stage, vc := t(valuation_lc - as.matrix(coef(dols)[1, 3:4]) %*% t(cbind(1, capital_slc)))]
+  data[series == stage, dc := t(deals_slc - as.matrix(coef(dols)[2, 3:4]) %*% t(cbind(1, capital_slc)))]
+}
+```
+
+```{r}
+#summary(feols(c(valuation_lcd, capital_slcd) ~ l(valuation_lcd, 1) + l(capital_slcd, 1) + l(vc, 1), data = data[series == "Series D"], panel.id = ~series + period, vcov = "hetero"))
+
+for (stage in unique(data$series)) { plot(data[series == stage, exp(vc) - 1], type = "l") }
+for (stage in unique(data$series)) { plot(data[series == stage, exp(dc) - 1], type = "l") }
+```
+
+
+```{r}
+# BRW Shocks
+data[, shocks := c(cumsum(brw[Year >= 2010, shocks]), NA), by = series]
+data[, shocks_d := shocks - shift(shocks), by = series]
+
+data
+```
+
+```{r}
+intrate_raw = fredr(
+  series_id = "GS1",
+  observation_start = as.Date("2010-03-31"),
+  observation_end = as.Date("2023-12-31"),
+  frequency = "q"
+)$value
+
+intrate_comp = fredr(
+  series_id = "GS1",
+  observation_start = as.Date("1994-03-31"),
+  observation_end = as.Date("2023-09-30"),
+  frequency = "q"
+)$value
+
+gdp = fredr(
+  series_id = "GDPC1",
+  observation_start = as.Date("2010-03-31"),
+  observation_end = as.Date("2023-12-31"),
+  frequency = "q"
+)$value
+
+cpi = fredr(
+  series_id = "CPIAUCNS",
+  observation_start = as.Date("2010-03-31"),
+  observation_end = as.Date("2023-12-31"),
+  frequency = "q"
+)$value
+
+nasdaq = fredr(
+  series_id = "NASDAQCOM",
+  observation_start = as.Date("2010-03-31"),
+  observation_end = as.Date("2023-12-31"),
+  frequency = "q"
+)$value
+
+eci = fredr(
+    series_id = "CIU2015400000000I",
+  observation_start = as.Date("2010-03-31"),
+  observation_end = as.Date("2023-12-31"),
+  frequency = "q"
+)$value
+
+# intrate_comp = fredr(
+#   series_id = "GS1",
+#   observation_start = as.Date("1988-06-30"),
+#   observation_end = as.Date("2019-12-31"),
+#   frequency = "q"
+# )$value
+
+#intrate_comp
+#brw
+
+data[, intrate := intrate_raw, by = series]
+data[, intrate_d := intrate - shift(intrate), by = series]
+
+intshock = data.table(
+  intrate = intrate_comp,
+  shocks = cumsum(brw$shocks)
+  #shocks = na.omit(bs$shocks)
+)
+
+intshock[, intrate_d := intrate - shift(intrate)]
+intshock[, shocks_d := shocks - shift(shocks)]
+
+intshock[, date := seq.Date(as.Date("1994/01/01"), as.Date("2023/09/30"), "1 quarter")]
+#intshock[, date := seq.Date(as.Date("1988/04/01"), as.Date("2019/12/31"), "1 quarter")]
+
+intshock
+
+feols(intrate_d ~ shocks, data = intshock)
+
+data[, gdp := gdp, by = series]
+data[, gdp_l := log(gdp), by = series]
+data[, gdp_ld := gdp_l - shift(gdp_l), by = series]
+
+data[, cpi := cpi, by = series]
+data[, cpi_l := log(cpi), by = series]
+data[, cpi_ld := cpi_l - shift(cpi_l), by = series]
+
+data[, nasdaq := nasdaq, by = series]
+data[, nasdaq_l := log(nasdaq), by = series]
+data[, nasdaq_ld := nasdaq_l - shift(nasdaq_l), by = series]
+
+data[, eci := eci, by = series]
+data[, eci_l := log(eci), by = series]
+data[, eci_ld := eci_l - shift(eci_l), by = series]
+```
+
+```{r}
+intshock[, series := "rates"]
+intshock[, intrate_inst := c(rep(NA, 0), predict(feols(intrate ~ shocks, data = intshock, panel.id = ~series + date)))]
+
+plot(x=intshock[, date], y=intshock[, intrate], type = "l")
+lines(x=intshock[, date], y=intshock[, intrate_inst], type = "l", col = "red")
+```
+
+```{r}
+coef_first_stage <- coef(feols(intrate ~ shocks, data = intshock))[2]
+```
+
+```{r}
+seed_model <- feols(f(valuation_ll, 0:12) ~ l(shocks, 0) + l(valuation_ll, 0:4) + l(deals_sll, 0:4) + l(capital_sll, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Seed"], panel.id = ~series + period, vcov = "hetero")
+seed_irf <- coef(seed_model)[, 3] / coef_first_stage
+seed_se <- se(seed_model)[, 3] / coef_first_stage
+
+ab_model <- feols(f(valuation_ll, 0:12) ~ l(shocks, 0) + l(valuation_ll, 0:4) + l(deals_sll, 0:4) + l(capital_sll, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Series A" | series == "Series B"], panel.id = ~series + period, vcov = "hetero")
+ab_irf <- coef(ab_model)[, 3] / coef_first_stage
+ab_se <- se(ab_model)[, 3] / coef_first_stage
+
+cd_model <- feols(f(valuation_ll, 0:12) ~ l(shocks, 0) + l(valuation_ll, 0:4) + l(deals_sll, 0:4) + l(capital_sll, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Series C" | series == "Series D"], panel.id = ~series + period, vcov = "hetero")
+cd_irf <- coef(cd_model)[, 3] / coef_first_stage
+cd_se <- se(cd_model)[, 3] / coef_first_stage
+
+sv <- ggplot() +
+  geom_line(aes(x=0:12, y=seed_irf, color = "Seed"), linewidth = 1) +
+  geom_line(aes(x=0:12, y=ab_irf, color = "Series A / B"), linewidth = 1) +
+  geom_line(aes(x=0:12, y=cd_irf, color = "Series C / D"), linewidth = 1) +
+  geom_ribbon(aes(x=0:12, ymin=seed_irf - seed_se, ymax=seed_irf + seed_se, fill = "Seed"), alpha = 0.2) +
+  geom_ribbon(aes(x=0:12, ymin=ab_irf - ab_se, ymax=ab_irf + ab_se, fill = "Series A / B"), alpha = 0.2) +
+  geom_ribbon(aes(x=0:12, ymin=cd_irf - cd_se, ymax=cd_irf + cd_se, fill = "Series C / D"), alpha = 0.2) +
+  scale_x_continuous(breaks=0:12, expand = c(0, 0)) +
+  scale_y_continuous(
+    labels = scales::percent_format(scale = 100),
+    breaks = seq(-0.3, 0.1, 0.1),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(
+    ylim = c(-0.3, 0.1)
+  ) +
+  #scale_color_manual(values = c("Seed" = scheme[1], "Series A / B" = scheme[2], "Series C / D" = scheme[3])) +
+  #scale_fill_manual(values = c("Seed" = scheme[1], "Series A / B" = scheme[2], "Series C / D" = scheme[3])) +
+  guides(fill = FALSE) +
+  labs(
+    title = "Seed Valuations Aren't Valuations",
+    subtitle = "Valuation Effect of 100 bps Unexpected Increase in 1YR U.S. Treasury Rate",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = "Quarters",
+    y = "% Change"
+  ) +
+  theme_whoisnnamdi +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.125, 0.2),
+  )
+
+sv
+```
+
+```{r}
+ggsave(dpi = "retina", plot = sv,   "sv.png",   width = 9, height = 6, units = "in")
+```
+
+```{r}
+seed_model <- feols(f(valuation_lc, 0:12) - l(valuation_lc, 1) ~ l(shocks, 0:2) + l(valuation_lcd, 0:4) + l(deals_slcd, 0:4) + l(capital_slcd, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Seed"], panel.id = ~series + period, vcov = "hetero")
+seed_irf <- coef(seed_model)[, 3] / coef_first_stage
+seed_se <- se(seed_model)[, 3] / coef_first_stage
+
+ab_model <- feols(f(valuation_lc, 0:12) - l(valuation_lc, 1) ~ l(shocks, 0:2) + l(valuation_lcd, 0:4) + l(deals_slcd, 0:4) + l(capital_slcd, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Series A" | series == "Series B"], panel.id = ~series + period, vcov = "hetero")
+ab_irf <- coef(ab_model)[, 3] / coef_first_stage
+ab_se <- se(ab_model)[, 3] / coef_first_stage
+
+cd_model <- feols(f(valuation_lc, 0:12) - l(valuation_lc, 1) ~ l(shocks, 0:2) + l(valuation_lcd, 0:4) + l(deals_slcd, 0:4) + l(capital_slcd, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Series C" | series == "Series D"], panel.id = ~series + period, vcov = "hetero")
+cd_irf <- coef(cd_model)[, 3] / coef_first_stage
+cd_se <- se(cd_model)[, 3] / coef_first_stage
+
+ggplot() +
+  geom_line(aes(x=0:12, y=seed_irf, color = "Seed"), linewidth = 1) +
+  geom_line(aes(x=0:12, y=ab_irf, color = "Series A / B"), linewidth = 1) +
+  geom_line(aes(x=0:12, y=cd_irf, color = "Series C / D"), linewidth = 1) +
+  geom_ribbon(aes(x=0:12, ymin=seed_irf - seed_se, ymax=seed_irf + seed_se, fill = "Seed"), alpha = 0.2) +
+  geom_ribbon(aes(x=0:12, ymin=ab_irf - ab_se, ymax=ab_irf + ab_se, fill = "Series A / B"), alpha = 0.2) +
+  geom_ribbon(aes(x=0:12, ymin=cd_irf - cd_se, ymax=cd_irf + cd_se, fill = "Series C / D"), alpha = 0.2) +
+  scale_x_continuous(breaks=0:12, expand = c(0, 0)) +
+  scale_y_continuous(
+    labels = scales::percent_format(scale = 100),
+    breaks = seq(-0.3, 0.1, 0.1),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(
+    ylim = c(-0.3, 0.1)
+  ) +
+  #scale_color_manual(values = c("Seed" = scheme[1], "Series A / B" = scheme[2], "Series C / D" = scheme[3])) +
+  #scale_fill_manual(values = c("Seed" = scheme[1], "Series A / B" = scheme[2], "Series C / D" = scheme[3])) +
+  guides(fill = FALSE) +
+  labs(
+    title = "Surprise Surprise",
+    subtitle = "Valuation Effect of 100 bps Unexpected Increase in 1YR U.S. Treasury Rate",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = "Quarters",
+    y = "% Change"
+  ) +
+  theme_whoisnnamdi +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.125, 0.2),
+  )
+```
+
+```{r}
+data_dfm <- data[, .(series, period, deals_sll, valuation_ll, capital_sll)]
+
+data_dfm <- data_dfm |> melt(measure.vars = c("deals_sll", "valuation_ll", "capital_sll")) |> dcast(period ~ series + variable, value.var = "value")
+
+lambda_hat <- data_dfm |> _[, lapply(.SD, \(x) na.omit(x - shift(x, 1))), .SDcols = -c("period")] |> prcomp(scale = TRUE) |> _$rotation[, 1:3]
+
+x_hat <- data_dfm |> _[, t := 1:.N] |> _[, lapply(.SD, \(x) residuals(lm(x ~ t))), .SDcols = -c("period", "t")]
+
+factors <- data.table(t(t(lambda_hat) %*% t(x_hat)))
+
+factors[, lapply(.SD, \(x) plot(x, type ="l"))]
+
+factors[, shocks := data[series == "Seed", shocks]]
+
+factors[, series := "Seed"]
+
+factors[, t := 1:.N]
+
+#vars::VAR(factors[, .(shocks, PC1, PC2, PC3)], p=2) |> vars::irf(n.ahead = 12) |> plot()
+
+t(lambda_hat %*% t(sapply(c("PC1", "PC2", "PC3"), function (x) coef(feols(f(.[x], 0:12) ~ shocks + l(PC1, 0:4) + l(PC2, 0:4) + l(PC3, 0:4), data = factors[t <= 40], panel.id = ~series + t, vcov = "hetero"))[, 4])))[, "Seed_valuation_ll"] |> plot(type = "l")
+
+# for (i in c("PC1", "PC2", "PC3")) {
+#   plot(coef(feols(f(.[i], 0:12) ~ shocks + l(PC1, 0:4) + l(PC2, 0:4) + l(PC3, 0:4), data = factors, panel.id = ~series + t, vcov = "hetero"))[, 4], type = "l")
+# }
+```
+
+```{r}
+sapply(unique(data$series), function(x) {data[series == x, capital_sll - deals_sll] |> plot(type = "l")})
+```
+
+
+```{r}
+eci_model <- feols(f(eci_l, 0:12) ~ l(shocks, 0) + l(eci_l, 0:4), data = data[series == "Seed"][as.numeric(t) <= 40], panel = ~series + period, vcov = "NW")
+
+eci_irf <- coef(eci_model)[, 4] / coef_first_stage
+eci_se <- se(eci_model)[, 4] / coef_first_stage
+
+#summary(lp_model)
+
+#plot(x=0:12, y=coef(lp_model)[, 4] / coef_first_stage, type = "l", ylim = c(-0.15, 0.15))
+
+nasdaq_model <- feols(f(nasdaq_l, 0:12) ~ l(shocks, 0) + l(nasdaq_l, 0:4), data = data[series == "Seed"][as.numeric(t) <= 40], panel = ~series + period, vcov = "NW")
+
+nasdaq_irf <- coef(nasdaq_model)[, 4] / coef_first_stage
+nasdaq_se <- se(nasdaq_model)[, 4] / coef_first_stage
+
+#summary(lp_model)
+
+#lines(x=0:12, y=coef(lp_model)[, 4] / coef_first_stage, type = "l")
+
+labor_cap <- ggplot() +
+  geom_line(aes(x=0:12, y=eci_irf, color = "Tech ECI"), linewidth = 1) +
+  geom_line(aes(x=0:12, y=nasdaq_irf, color = "NASDAQ"), linewidth = 1) +
+  geom_ribbon(aes(x=0:12, ymin=eci_irf - eci_se, ymax=eci_irf + eci_se, fill = "Tech ECI"), alpha = 0.2) +
+  geom_ribbon(aes(x=0:12, ymin=nasdaq_irf - nasdaq_se, ymax=nasdaq_irf + nasdaq_se, fill = "NASDAQ"), alpha = 0.2) +
+  scale_x_continuous(breaks=0:12, expand = c(0, 0)) +
+  scale_y_continuous(
+    labels = scales::percent_format(scale = 100),
+    breaks = seq(-0.2, 0.1, 0.1),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(
+    ylim = c(-0.2, 0.1)
+  ) +
+  guides(fill = FALSE) +
+  labs(
+    title = "No Union, No Problem",
+    subtitle = "Effect of 100 bps Unexpected Increase in 1YR U.S. Treasury Rate",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = "Quarters",
+    y = "% Change"
+  ) +
+  theme_whoisnnamdi +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.125, 0.2),
+  )
+
+labor_cap
+```
+
+```{r}
+ggsave(dpi = "retina", plot = labor_cap,   "labor_cap.png",   width = 9, height = 6, units = "in")
+```
+
+```{r}
+ceo <- c(213.6, 242.8, 368.6, 321.8, 325.3, 318.5, 269.8, 299.7, 291.7, 311.8, 365.6, 398.8)
+
+plot(x=2010:2021, y=log(ceo / ceo[1]), type="l")
+```
+
+```{r}
+stage = "Seed"
+
+model_ar <- feols(f(valuation_ll, 8) - l(valuation_ll, 0) ~ l(valuation_ll, 0:4) + t, data = data[series == stage][as.numeric(t) <= 40], panel = ~series + period, vcov = "NW")
+model_eci <- feols(f(valuation_ll, 8) - l(valuation_ll, 0) ~ l(eci_l, 0:4), data = data[series == stage][as.numeric(t) <= 40], panel = ~series + period, vcov = "NW")
+model_joint <- feols(f(valuation_ll, 8) - l(valuation_ll, 0) ~ l(valuation_ll, 0:4) + l(eci_l, 0), data = data[series == stage][as.numeric(t) <= 40], panel = ~series + period, vcov = "NW")
+
+ggplot() +
+  geom_line(aes(x=1:length(predict(model_ar)), y=na.omit(data[series == stage][as.numeric(t) <= 40][, shift(valuation_ll, -8) - shift(valuation_ll, 0)][c(-1:-4)]), color = "True"), linewidth = 1) +
+  geom_line(aes(x=1:length(predict(model_ar)), y=predict(model_ar), color = "AR(4)"), linewidth = 1) +
+  geom_line(aes(x=1:length(predict(model_ar)), y=predict(model_eci), color = "ECI Only"), linewidth = 1) +
+  geom_line(aes(x=1:length(predict(model_ar)), y=predict(model_joint), color = "Joint"), linewidth = 1) +
+  see::theme_modern()
+```
+
+```{r}
+barplot(residuals(feols(shocks ~ l(shocks, 1), data = data[series == "Seed"][as.numeric(t) <= 40], panel = ~series + period, vcov = "NW")), type="l")
+#plot(coef(feols(f(valuation_ll, 0:16) - l(valuation_ll, 1) ~ l(eci_l, 0:1) + l(valuation_ll, 0:4), data = data[series == "Seed"][as.numeric(t) <= 40], panel = ~series + period, vcov = "NW"))[, 4], type="l")
+```
+
+```{python}
+# Generate AR(1) with 0.75 persistence
+np.random.seed(123)
+series_len = 100
+e = np.random.normal(0, 1, series_len)
+y = np.zeros(series_len)
+phi_1 = 0.75
+phi_2 = 0
+
+h1 = 0
+H = 20
+
+for i in range(2, series_len):
+    y[i] = phi_1 * y[i-1] + phi_2 * y[i-2] + e[i]
+
+ir_theory = np.zeros(H - h1 + 1)
+ir_theory[0] = 1
+
+for i in range(1, len(ir_theory)):
+    ir_theory[i] = phi_1 * ir_theory[i-1]
+
+ir_reg = lproj(y, y, None, style="reg", H=H, h1=h1, r=2, zero=False, lam=[0])
+ir_smooth = lproj(y, y, None, style="smooth", H=H, h1=h1, r=2, zero=False, lam=[0.1, 1, 10, 100, 1000])
+lam_opt = lproj_cv(ir_smooth, 5)["idx_opt"]
+errors_reg = lproj_conf(ir_reg, 0)
+errors_smooth = lproj_conf(ir_smooth, lam_opt)
+
+# plt.ylim(-0.5, 1.5)
+# plt.plot(ir_reg["ir"], label="reg")
+# plt.plot(errors_reg["irc"], label="conf")
+# plt.plot(ir_smooth["ir"][:, lam_opt], label="smooth")
+# plt.plot(errors_smooth["irc"], label="conf")
+# plt.plot(ir_theory, label="theory")
+```
+
+```{r}
+ggplot() +
+  geom_line(aes(x = 0:20, y = py$ir_reg$ir, color = "reg")) +
+  geom_line(aes(x = 0:20, y = py$ir_smooth$ir[, py$lam_opt + 1], color = "smooth")) +
+  geom_line(aes(x = 0:20, y = py$ir_theory, color = "theory")) +
+  geom_ribbon(aes(x = 0:20, ymin = py$errors_reg$conf[, 1], ymax = py$errors_reg$conf[, 2], fill = "reg"), alpha = 0.2) +
+  geom_ribbon(aes(x = 0:20, ymin = py$errors_smooth$conf[, 1], ymax = py$errors_smooth$conf[, 2], fill = "smooth"), alpha = 0.2) +
+  scale_color_manual(values = c("reg" = "red", "smooth" = "blue", "theory" = "black")) +
+  scale_fill_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  theme_minimal()
+```
+
+```{r}
+# feols(f(valuation_ll, 0:12) - l(valuation_ll, 1) ~ l(shocks, 0) + l(valuation_lld, 0:2) + l(deals_slld, 0:2) + l(capital_sld, 0:2) + t, data = data[as.numeric(t) <= 40][series == stage], panel = ~series + period, vcov = "NW")
+
+data_series <- data[series == "Series A" | series == "Series B"][as.numeric(t) <= 40][, .(valuation_ll, shocks, deals_sll, capital_sll, series)]
+H = 12L
+
+design_mat <- na.omit(as.matrix(cbind(
+  data_series[, valuation_ll - mean(valuation_ll, na.rm = TRUE), by = series][, -c("series")],
+  data_series[, shocks - mean(shocks, na.rm = TRUE), by = series][, -c("series")],
+  #data_series[, shift(shocks, 1:4)],
+  # data_series[, shift(valuation_ll, 0:4), by = series][, -c("series")],
+  # data_series[, shift(deals_sll, 0:4), by = series][, -c("series")],
+  # data_series[, shift(capital_sll, 0:4), by = series][, -c("series")],
+  # data_series[, series == "Series A", by = series][, -c("series")] * 1
+  data_series[, c(shift(valuation_ll, 0:4), shift(deals_sll, 0:4), shift(capital_sll, 0:4)), by = series][, lapply(.SD, \(x) x - mean(x, na.rm=TRUE)), by = series][, -c("series")]
+  # data_series$t
+)))
+
+y <- matrix(design_mat[, 1])
+x <- matrix(design_mat[, 2])
+w <- as.matrix(design_mat[, -c(1, 2)])
+
+ir_reg <- py$lproj(y=y, x=x, w=w, style="reg", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(0))
+ir_smooth <- py$lproj(y=y, x=x, w=w, style="smooth", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(c(0.0001, 0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000, 100000)))
+lam_opt = as.integer(py$lproj_cv(ir_smooth, 5L)["idx_opt"])
+errors_reg <- py$lproj_conf(ir_reg, 0L)$conf / coef_first_stage
+#errors_smooth <- py$lproj_conf(ir_smooth, 0L)$conf / coef_first_stage
+errors_smooth <- py$lproj_conf(ir_smooth, lam_opt)$conf / coef_first_stage
+ir_reg <- ir_reg$ir / coef_first_stage
+#ir_smooth <- ir_smooth$ir[, 1] / coef_first_stage
+ir_smooth <- ir_smooth$ir[, lam_opt + 1L] / coef_first_stage
+
+ggplot() +
+  geom_line(aes(x = 0:H, y = ir_reg, color = "reg")) +
+  geom_line(aes(x = 0:H, y = ir_smooth, color = "smooth")) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_reg[, 1], ymax = errors_reg[, 2], fill = "reg"), alpha = 0.2) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_smooth[, 1], ymax = errors_smooth[, 2], fill = "smooth"), alpha = 0.2) +
+  scale_color_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_fill_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_x_continuous(breaks = 0:H) +
+  theme_minimal()
+```
+
+```{r}
+# feols(f(valuation_ll, 0:12) - l(valuation_ll, 1) ~ l(shocks, 0) + l(valuation_lld, 0:2) + l(deals_slld, 0:2) + l(capital_sld, 0:2) + t, data = data[as.numeric(t) <= 40][series == stage], panel = ~series + period, vcov = "NW")
+
+data_series <- data[series == "Seed"][as.numeric(t) <= 40]
+H = 12L
+
+design_mat <- na.omit(as.matrix(cbind(
+  data_series$nasdaq_l,
+  data_series[, shift(shocks, 0:1)],
+  data_series[, shift(nasdaq_l, 0:4)]
+)))
+
+y <- matrix(design_mat[, 1])
+x <- matrix(design_mat[, 2])
+w <- as.matrix(design_mat[, -c(1, 2)])
+
+ir_reg <- py$lproj(y=y, x=x, w=w, style="reg", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(0))
+ir_smooth <- py$lproj(y=y, x=x, w=w, style="smooth", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(c(0.01, 0.1, 1, 10, 100, 1000, 10000)))
+lam_opt = as.integer(py$lproj_cv(ir_smooth, 5L)["idx_opt"])
+errors_reg <- py$lproj_conf(ir_reg, 0L)$conf / coef_first_stage
+#errors_smooth <- py$lproj_conf(ir_smooth, 0L)$conf / coef_first_stage
+errors_smooth <- py$lproj_conf(ir_smooth, lam_opt)$conf / coef_first_stage
+ir_reg <- ir_reg$ir / coef_first_stage
+#ir_smooth <- ir_smooth$ir[, 1] / coef_first_stage
+ir_smooth <- ir_smooth$ir[, lam_opt + 1L] / coef_first_stage
+
+ggplot() +
+  geom_line(aes(x = 0:H, y = ir_reg, color = "reg")) +
+  geom_line(aes(x = 0:H, y = ir_smooth, color = "smooth")) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_reg[, 1], ymax = errors_reg[, 2], fill = "reg"), alpha = 0.2) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_smooth[, 1], ymax = errors_smooth[, 2], fill = "smooth"), alpha = 0.2) +
+  scale_color_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_fill_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_x_continuous(breaks = 0:H) +
+  theme_minimal()
+```
+
+```{r}
+# feols(f(valuation_ll, 0:12) - l(valuation_ll, 1) ~ l(shocks, 0) + l(valuation_lld, 0:2) + l(deals_slld, 0:2) + l(capital_sld, 0:2) + t, data = data[as.numeric(t) <= 40][series == stage], panel = ~series + period, vcov = "NW")
+
+data_series <- data[series == "Seed"][as.numeric(t) <= 40]
+H = 12L
+
+design_mat <- na.omit(as.matrix(cbind(
+  data_series$nasdaq_l,
+  data_series$shocks,
+  data_series[, shift(nasdaq_l, 0:4)]
+)))
+
+y <- matrix(design_mat[, 1])
+x <- matrix(design_mat[, 2])
+w <- as.matrix(design_mat[, -c(1, 2)])
+
+ir_reg <- py$lproj(y=y, x=x, w=w, style="reg", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(0))
+ir_smooth <- py$lproj(y=y, x=x, w=w, style="smooth", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(c(0.01, 0.1, 1, 10, 100, 1000)))
+lam_opt = as.integer(py$lproj_cv(ir_smooth, 5L)["idx_opt"])
+errors_reg <- py$lproj_conf(ir_reg, 0L)$conf / coef_first_stage
+#errors_smooth <- py$lproj_conf(ir_smooth, 0L)$conf / coef_first_stage
+errors_smooth <- py$lproj_conf(ir_smooth, lam_opt)$conf / coef_first_stage
+ir_reg <- ir_reg$ir / coef_first_stage
+#ir_smooth <- ir_smooth$ir[, 1] / coef_first_stage
+ir_smooth <- ir_smooth$ir[, lam_opt + 1L] / coef_first_stage
+
+ggplot() +
+  geom_line(aes(x = 0:H, y = ir_reg, color = "reg")) +
+  geom_line(aes(x = 0:H, y = ir_smooth, color = "smooth")) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_reg[, 1], ymax = errors_reg[, 2], fill = "reg"), alpha = 0.2) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_smooth[, 1], ymax = errors_smooth[, 2], fill = "smooth"), alpha = 0.2) +
+  scale_color_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_fill_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_x_continuous(breaks = 0:H) +
+  theme_minimal()
+```
+
+```{r}
+# feols(f(valuation_ll, 0:12) - l(valuation_ll, 1) ~ l(shocks, 0) + l(valuation_lld, 0:2) + l(deals_slld, 0:2) + l(capital_sld, 0:2) + t, data = data[as.numeric(t) <= 40][series == stage], panel = ~series + period, vcov = "NW")
+
+data_series <- data[series == "Seed"][as.numeric(t) <= 40]
+H = 12L
+
+design_mat <- na.omit(as.matrix(cbind(
+  data_series$valuation_ll,
+  data_series$eci_l,
+  data_series[, shift(eci_l, 1:2)],
+  data_series[, shift(valuation_ll, 0:2)]
+)))
+
+y <- matrix(design_mat[, 1])
+x <- matrix(design_mat[, 2])
+w <- as.matrix(design_mat[, -c(1, 2)])
+
+ir_reg <- py$lproj(y=y, x=x, w=w, style="reg", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(0))
+ir_smooth <- py$lproj(y=y, x=x, w=w, style="smooth", H=H, h1=0L, r=3L, zero=FALSE, lam=matrix(c(0.01, 0.1, 1, 10, 100, 1000)))
+lam_opt = as.integer(py$lproj_cv(ir_smooth, 5L)["idx_opt"])
+errors_reg <- py$lproj_conf(ir_reg, 0L)$conf
+#errors_smooth <- py$lproj_conf(ir_smooth, 0L)$conf
+errors_smooth <- py$lproj_conf(ir_smooth, lam_opt)$conf
+ir_reg <- ir_reg$ir
+#ir_smooth <- ir_smooth$ir[, 1] / coef_first_stage
+ir_smooth <- ir_smooth$ir[, lam_opt + 1L]
+
+ggplot() +
+  geom_line(aes(x = 0:H, y = ir_reg, color = "reg")) +
+  geom_line(aes(x = 0:H, y = ir_smooth, color = "smooth")) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_reg[, 1], ymax = errors_reg[, 2], fill = "reg"), alpha = 0.2) +
+  geom_ribbon(aes(x = 0:H, ymin = errors_smooth[, 1], ymax = errors_smooth[, 2], fill = "smooth"), alpha = 0.2) +
+  scale_color_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_fill_manual(values = c("reg" = "red", "smooth" = "blue")) +
+  scale_x_continuous(breaks = 0:H) +
+  theme_minimal()
+```
+
+```{r}
+feols(valuation_ll ~ eci_l + l(eci_ld, -4:4) + t, data = data[series == "Seed"], panel = ~series + period, vcov = "NW")
+```
+
+```{r}
+data_to_plot <- na.omit(data[series == "Seed"][, valuation_l])
+
+arima(data_to_plot, order = c(3,1,1))
+plot(data_to_plot, type="l")
+#plot(cumsum(arima.sim(list(ar = c(-0.75, 0.67, 0.87), ma = 1), n = 40)) + c(1:40)/4, type = "l")
+```
+
+```{r}
+library(dlm)
+```
+
+```{r}
+fn <- function(parm) {
+  dlmModPoly(order = 1,
+             dV = exp(parm[1]),
+             dW = exp(parm[2]))
+}
+
+fit <- dlmMLE(data_to_plot, rep(0, 2), build = fn, hessian = TRUE)
+(conv <- fit$convergence)  # zero for converged
+
+loglik <- dlmLL(data_to_plot, dlmModPoly(1))
+n.coef <- 2
+r.aic <- (2 * (loglik)) + 2 * (sum(n.coef)) #dlmLL caculates the neg. LL
+r.bic <- (2 * (loglik)) + (log(length(data_to_plot))) * (n.coef)
+
+mod <- fn(fit$par)
+obs.error.var <- V(mod)
+state.error.var <- W(mod)
+
+filtered <- dlmFilter(data_to_plot, mod = mod)
+smoothed <- dlmSmooth(filtered)
+
+resids <- residuals(filtered, sd = FALSE)
+#mu <- dropFirst(smoothed$s)
+mu <- dropFirst(filtered$m)
+mu.1 <- mu[1]
+mu.end <- mu[length(mu)]
+
+par(mfrow = c(2, 1),
+    mar = c(2.2, 2.2, 1, 1),
+    cex = 0.8)
+plot.ts(
+  data_to_plot,
+  col = "darkgrey",
+  xlab = "",
+  ylab = "",
+  lwd = 1.5
+)
+lines(mu , col = "black")
+legend(
+  "topright",
+  legend = c("Observed Deflator", "Stochastic level"),
+  lwd = c(2, 1),
+  col = c("darkgrey", "black"),
+  bty = "n"
+)
+
+plot.ts(
+  resids,
+  ylab = "",
+  xlab = "",
+  col = "darkgrey",
+  lwd = 1.5
+)
+abline(h = 0)
+legend(
+  "topright",
+  legend = "Residuals",
+  lwd = 1.5,
+  col = "darkgrey",
+  bty = "n"
+)
+
+par(mfrow = c(1, 1),
+    mar = c(2.2, 2.2, 1, 1),
+    cex = 0.8)
+hist(
+  resids,
+  prob = TRUE,
+  col = "grey",
+  main = "",
+  breaks = seq(-4.5, 7, length.out = 30)
+)
+
+tsm::ac(resids)  # acf
+
+cat("AIC", r.aic)
+cat("BIC", r.bic)
+cat("V.variance", obs.error.var)
+cat("W.variance", state.error.var)
+
+Box.test(resids,
+         lag = 12,
+         type = "Ljung",
+         fitdf = 2)  # joint autocorrelation
+
+shapiro.test(resids)  # normality
+```
+
+```{r}
+fn <- function(parm) {
+  dlmModPoly(order = 2,
+             dV = exp(parm[1]),
+             dW = exp(parm[2:3]))
+}
+
+fit <- dlmMLE(data_to_plot, rep(0, 3), build = fn, hessian = TRUE)
+conv <- fit$convergence  # zero for converged
+
+loglik <- dlmLL(data_to_plot, dlmModPoly(2))
+n.coef <- 3
+r.aic <- (2 * (loglik)) + 2 * (sum(n.coef)) #dlmLL caculates the neg. LL
+r.bic <- (2 * (loglik)) + (log(length(data_to_plot))) * (n.coef)
+
+mod <- fn(fit$par)
+obs.error.var <- V(mod)
+state.error.var <- diag(W(mod))
+
+filtered <- dlmFilter(data_to_plot, mod = mod)
+smoothed <- dlmSmooth(filtered)
+resids <- residuals(filtered, sd = FALSE)
+#mu <- dropFirst(smoothed$s[, 1])
+mu <- dropFirst(filtered$m[, 1])
+#upsilon <- dropFirst(smoothed$s[, 2])
+upsilon <- dropFirst(filtered$m[, 2])
+mu.1 <- mu[1]
+mu.end <- mu[length(mu)]
+ups.1 <- upsilon[1]
+ups.end <- upsilon[length(mu)]
+
+cat("AIC", r.aic)
+cat("BIC", r.bic)
+cat("V.variance", obs.error.var)
+cat("W.variance", state.error.var)
+
+Box.test(resids, lag=12, type="Ljung", fitdf=2)  # joint autocorrelation
+shapiro.test(resids)  # normality
+
+par(mfrow = c(3, 1),
+    mar = c(2.2, 2.2, 1, 1),
+    cex = 0.8)
+plot.ts(
+  data_to_plot,
+  col = "darkgrey",
+  xlab = "",
+  ylab = "",
+  lwd = 2
+)
+lines(mu , col = "black")
+legend(
+  "topright",
+  legend = c("Observed Deflator", "Stochastic level"),
+  lwd = c(2, 1),
+  col = c("darkgrey", "black"),
+  bty = "n"
+)
+
+plot.ts(
+  upsilon,
+  col = "darkgrey",
+  xlab = "",
+  ylab = "",
+  lwd = 2
+)
+legend(
+  "topright",
+  legend = "Slope",
+  lwd = 2,
+  col = "darkgrey",
+  bty = "n"
+)
+
+plot.ts(
+  resids,
+  ylab = "",
+  xlab = "",
+  col = "darkgrey",
+  lwd = 2
+)
+abline(h = 0)
+legend(
+  "topright",
+  legend = "Residuals",
+  lwd = 2,
+  col = "darkgrey",
+  bty = "n"
+)
+
+par(mfrow = c(1, 1),
+    mar = c(2.2, 2.2, 1, 1),
+    cex = 0.8)
+hist(
+  resids,
+  prob = TRUE,
+  col = "grey",
+  main = "",
+  breaks = seq(-4.5, 7, length.out = 30)
+)
+
+tsm::ac(resids)  # acf
+```
+
+```{r}
+plot(upsilon, ylim=c(-0.2, 0.2), type="l")
+```
+
+```{r}
+data_to_plot <- na.omit(data[series == "Seed"][, valuation_l])
+#data_to_plot <- na.omit(data[series == "Seed"][, deals_sl])
+```
+
+```{r}
+library(rstan) # observe startup messages
+library(bayesplot)
+library(loo)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+standata <- within(list(), {
+  y <- data_to_plot
+  n <- length(y)
+})
+
+model_file <- "llm.stan"
+cat(paste(readLines(model_file)), sep = '\n')
+
+fit <- stan(file = model_file, data = standata,
+            warmup = 4000, iter = 50000, chains = 4)
+```
+
+```{r}
+summary(fit)$summary |> 
+  head()
+
+mu <- get_posterior_mean(fit, par = 'mu')[, 'mean-all chains']
+sigma_irreg <- get_posterior_mean(fit, par = 'sigma_irreg')[, 'mean-all chains']
+sigma_level <- get_posterior_mean(fit, par = 'sigma_level')[, 'mean-all chains']
+resids <- data_to_plot - mu
+
+print(fit, pars = c('sigma_level',
+                    'sigma_irreg'))
+
+log_lik_1 <- extract_log_lik(fit, merge_chains = FALSE)
+r_eff_1 <- relative_eff(exp(log_lik_1), cores = parallel::detectCores())
+loo_1 <- loo(log_lik_1, r_eff = r_eff_1, cores = parallel::detectCores(), save_psis = TRUE)
+print(loo_1)
+plot(loo_1)
+
+# ppc_loo_pit_qq(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_1$psis_object)
+# )
+# 
+# ppc_loo_pit_overlay(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_1$psis_object)
+# )
+```
+
+```{r}
+mcmc_areas(as.matrix(fit),
+                      regex_pars = c("sigma_level", "sigma_irreg"))
+
+rstan::traceplot(fit, pars = c("sigma_level", "sigma_irreg"))
+```
+
+```{r}
+plot.ts(data_to_plot)
+lines(mu, col = "red")
+
+plot.ts(diff(data_to_plot))
+lines(diff(mu), col = "red")
+```
+
+```{r}
+plot.ts(resids)
+
+par(mfrow = c(1, 1), mar = c(2.2, 2.2, 1, 1), cex = 0.8)
+hist(
+  resids,
+  prob = TRUE,
+  col = "grey",
+  main = "",
+  #breaks = seq(-4.5, 7, length.out = 30)
+)
+
+tsm::ac(resids)
+```
+
+```{r}
+standata <- within(list(), {
+  y <- data_to_plot
+  n <- length(y)
+})
+
+model_file <- "lltm.stan"
+cat(paste(readLines(model_file)), sep = '\n')
+
+fit <- stan(file = model_file, data = standata,
+            warmup = 4000, iter = 10000, chains = 4)
+```
+
+```{r}
+summary(fit)$summary |> 
+  head()
+
+mu <- get_posterior_mean(fit, par = 'mu')[, 'mean-all chains']
+g <- get_posterior_mean(fit, par = 'g')[, 'mean-all chains']
+sigma_irreg <- get_posterior_mean(fit, par = 'sigma_irreg')[, 'mean-all chains']
+sigma_drift <- get_posterior_mean(fit, par = 'sigma_drift')[, 'mean-all chains']
+sigma_level <- get_posterior_mean(fit, par = 'sigma_level')[, 'mean-all chains']
+resids <- data_to_plot
+
+print(fit, pars = c('sigma_level',
+                    'sigma_drift',
+                    'sigma_irreg'))
+
+log_lik_2 <- extract_log_lik(fit, merge_chains = FALSE)
+r_eff_2 <- relative_eff(exp(log_lik_2), cores = parallel::detectCores())
+loo_2 <- loo(log_lik_2, r_eff = r_eff_2, cores = parallel::detectCores(), save_psis = TRUE)
+print(loo_2)
+plot(loo_2)
+
+# ppc_loo_pit_qq(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_2$psis_object)
+# )
+# 
+# ppc_loo_pit_overlay(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_2$psis_object)
+# )
+```
+
+```{r}
+mcmc_areas(
+  as.matrix(fit), 
+  regex_pars = c("sigma_level", "sigma_drift", "sigma_irreg")
+)
+
+rstan::traceplot(fit, pars = c("sigma_level", "sigma_drift", "sigma_irreg"))
+```
+
+```{r}
+plot.ts(data_to_plot)
+lines(mu, col = "red")
+
+plot.ts(diff(data_to_plot))
+lines(diff(mu), col = "red")
+lines(g, col = "blue")
+plot.ts(diff(mu), col = "red")
+lines(g, col = "blue")
+ar(diff(data_to_plot))
+ar(diff(mu))
+```
+
+```{r}
+#plot.ts(data_to_plot - first(data_to_plot))
+#plot.ts(exp(mu - first(mu)))
+#lines(mu - first(mu), col = "red")
+plot.ts(exp(log(eci) - first(log(eci))), col = "red")
+lines(exp(log(cpi) - first(log(cpi))), col = "blue")
+#lines(data_to_plot - log(cpi) + first(log(cpi)), col = "red")
+
+plot.ts(data_to_plot - log(cpi) + first(log(cpi)))
+#plot.ts(log(eci))
+plot.ts(log(eci) - log(cpi) + first(log(cpi)), col = "red")
+```
+
+
+```{r}
+plot.ts(resids)
+
+par(mfrow = c(1, 1), mar = c(2.2, 2.2, 1, 1), cex = 0.8)
+hist(
+  resids,
+  prob = TRUE,
+  col = "grey",
+  main = "",
+  #breaks = seq(-4.5, 7, length.out = 30)
+)
+
+tsm::ac(resids)
+```
+
+```{r}
+standata <- within(list(), {
+  y <- data_to_plot
+  n <- length(y)
+})
+
+model_file <- "lltmc.stan"
+cat(paste(readLines(model_file)), sep = '\n')
+
+fit <- stan(file = model_file, data = standata,
+            warmup = 4000, iter = 10000, chains = 4)
+```
+
+```{r}
+summary(fit)$summary |> 
+  head()
+
+mu <- get_posterior_mean(fit, par = 'mu')[, 'mean-all chains']
+g <- get_posterior_mean(fit, par = 'g')[, 'mean-all chains']
+sigma_irreg <- get_posterior_mean(fit, par = 'sigma_irreg')[, 'mean-all chains']
+#sigma_drift <- get_posterior_mean(fit, par = 'sigma_drift')[, 'mean-all chains']
+sigma_level <- get_posterior_mean(fit, par = 'sigma_level')[, 'mean-all chains']
+resids <- data_to_plot
+
+print(fit, pars = c('sigma_level',
+                    'g',
+                    'sigma_irreg'))
+
+log_lik_3 <- extract_log_lik(fit, merge_chains = FALSE)
+r_eff_3 <- relative_eff(exp(log_lik_3), cores = parallel::detectCores())
+loo_3 <- loo(log_lik_3, r_eff = r_eff_3, cores = parallel::detectCores(), save_psis = TRUE)
+print(loo_3)
+plot(loo_3)
+
+# ppc_loo_pit_qq(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_3$psis_object)
+# )
+# 
+# ppc_loo_pit_overlay(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_3$psis_object)
+# )
+```
+
+```{r}
+mcmc_areas(
+  as.matrix(fit), 
+  pars = c("sigma_level", "g", "sigma_irreg")
+)
+
+rstan::traceplot(fit, pars = c("sigma_level", "g", "sigma_irreg"))
+```
+
+```{r}
+plot.ts(data_to_plot)
+lines(mu, col = "red")
+
+plot.ts(diff(data_to_plot))
+lines(diff(mu), col = "red")
+#lines(g, col = "blue")
+plot.ts(diff(mu), col = "red")
+lines(g, col = "blue")
+ar(diff(data_to_plot))
+ar(diff(mu))
+```
+
+```{r}
+standata <- within(list(), {
+  y <- data_to_plot
+  n <- length(y)
+})
+
+model_file <- "lltmcrw.stan"
+cat(paste(readLines(model_file)), sep = '\n')
+
+fit <- stan(file = model_file, data = standata,
+            warmup = 4000, iter = 10000, chains = 4)
+```
+
+```{r}
+summary(fit)$summary |> 
+  head()
+
+mu <- get_posterior_mean(fit, par = 'mu')[, 'mean-all chains']
+gamma <- get_posterior_mean(fit, par = 'gamma')[, 'mean-all chains']
+sigma_irreg <- get_posterior_mean(fit, par = 'sigma_irreg')[, 'mean-all chains']
+#sigma_drift <- get_posterior_mean(fit, par = 'sigma_drift')[, 'mean-all chains']
+sigma_level <- get_posterior_mean(fit, par = 'sigma_level')[, 'mean-all chains']
+resids <- data_to_plot - mu
+
+print(fit, pars = c('sigma_level',
+                    'gamma',
+                    'sigma_irreg'))
+
+log_lik_4 <- extract_log_lik(fit, merge_chains = FALSE)
+r_eff_4 <- relative_eff(exp(log_lik_4), cores = parallel::detectCores())
+loo_4 <- loo(log_lik_4, r_eff = r_eff_4, cores = parallel::detectCores(), save_psis = TRUE)
+print(loo_4)
+plot(loo_4)
+
+# ppc_loo_pit_qq(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_3$psis_object)
+# )
+# 
+# ppc_loo_pit_overlay(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_3$psis_object)
+# )
+```
+
+```{r}
+mcmc_areas(
+  as.matrix(fit), 
+  pars = c("sigma_level", "gamma", "sigma_irreg")
+)
+
+rstan::traceplot(fit, pars = c("sigma_level", "gamma", "sigma_irreg"))
+```
+
+```{r}
+plot.ts(resids)
+
+par(mfrow = c(1, 1), mar = c(2.2, 2.2, 1, 1), cex = 0.8)
+hist(
+  resids,
+  prob = TRUE,
+  col = "grey",
+  main = "",
+  #breaks = seq(-4.5, 7, length.out = 30)
+)
+
+tsm::ac(resids)
+```
+
+```{r}
+plot.ts(data_to_plot)
+lines(mu, col = "red")
+
+plot.ts(diff(data_to_plot))
+lines(diff(mu), col = "red")
+lines(g, col = "blue")
+plot.ts(diff(mu), col = "red")
+lines(g, col = "blue")
+ar(diff(data_to_plot))
+ar(diff(mu))
+```
+
+```{r}
+standata <- within(list(), {
+  y <- data_to_plot
+  n <- length(y)
+})
+
+model_file <- "lltmcrwrw.stan"
+cat(paste(readLines(model_file)), sep = '\n')
+
+fit <- stan(file = model_file, data = standata,
+            warmup = 4000, iter = 10000, chains = 4)
+```
+
+```{r}
+summary(fit)$summary |> 
+  head()
+
+mu <- get_posterior_mean(fit, par = 'mu')[, 'mean-all chains']
+gamma <- get_posterior_mean(fit, par = 'gamma')[, 'mean-all chains']
+sigma_irreg <- get_posterior_mean(fit, par = 'sigma_irreg')[, 'mean-all chains']
+sigma_gamma <- get_posterior_mean(fit, par = 'sigma_gamma')[, 'mean-all chains']
+sigma_level <- get_posterior_mean(fit, par = 'sigma_level')[, 'mean-all chains']
+resids <- data_to_plot - mu
+
+print(fit, pars = c('sigma_level',
+                    'sigma_gamma',
+                    'sigma_irreg'))
+
+log_lik_5 <- extract_log_lik(fit, merge_chains = FALSE)
+r_eff_5 <- relative_eff(exp(log_lik_5), cores = parallel::detectCores())
+loo_5 <- loo(log_lik_5, r_eff = r_eff_5, cores = parallel::detectCores(), save_psis = TRUE)
+print(loo_5)
+plot(loo_5)
+
+# ppc_loo_pit_qq(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_3$psis_object)
+# )
+# 
+# ppc_loo_pit_overlay(
+#   y = data_to_plot,
+#   yrep = extract(fit, pars = "yrep")$yrep,
+#   lw = weights(loo_3$psis_object)
+# )
+```
+
+```{r}
+mcmc_areas(
+  as.matrix(fit), 
+  pars = c("sigma_level", "sigma_gamma", "sigma_irreg")
+)
+
+rstan::traceplot(fit, pars = c("sigma_level", "sigma_gamma", "sigma_irreg"))
+```
+
+```{r}
+plot.ts(data_to_plot)
+lines(mu, col = "red")
+
+plot.ts(diff(data_to_plot))
+lines(diff(mu), col = "red")
+#lines(g, col = "blue")
+#plot.ts(diff(mu), col = "red")
+#lines(g, col = "blue")
+ar(diff(data_to_plot))
+ar(diff(mu))
+
+plot.ts(gamma)
+```
+
+```{r}
+s_obs_draws <- tidybayes::spread_draws(fit, sigma_irreg)
+
+tidybayes::gather_draws(fit, gamma[i]) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x = i, y = .value)) +
+  tidybayes::stat_lineribbon(.width = c(.99, .95, .8, .5), color = "#08519C") +
+  facet_wrap(~.chain, scales = "free") +
+  scale_fill_brewer() +
+  labs(title = "Slope of Linear Trend over Time",
+       subtitle = "Positive values imply increasing level, negative values imply decreasing level.")
+
+tidybayes::gather_draws(fit, sigma_level, sigma_gamma, sigma_irreg) %>%
+  ggplot(aes(x = .value, y = .chain)) +
+  tidybayes::stat_halfeye() +
+  facet_wrap(~.variable, scales = "free")
+
+tidybayes::gather_draws(fit, mu[i]) %>%
+  dplyr::ungroup() %>%
+  dplyr::inner_join(s_obs_draws, by = c(".chain", ".iteration", ".draw")) %>%
+  dplyr::mutate(y = rnorm(dplyr::n(), mean = .value, sd = sigma_irreg)) %>%
+  ggplot(aes(x = i, y = y)) +
+  tidybayes::stat_lineribbon(.width = c(.99, .95, .8, .5), color = "#08519C") +
+  facet_wrap(~.chain, scales = "free") +
+  scale_fill_brewer() +
+  scale_size_continuous(range = c(0.1, 2))
+```
+
+
+```{r}
+plot.ts(data_to_plot)
+lines(mu, col = "red")
+
+plot.ts(diff(data_to_plot))
+lines(diff(mu), col = "red")
+#lines(g, col = "blue")
+#plot.ts(diff(mu), col = "red")
+#lines(g, col = "blue")
+ar(diff(data_to_plot))
+ar(diff(mu))
+
+plot.ts(gamma)
+```
+
+```{r}
+stage <- "Seed"
+
+#data_to_plot <- na.omit(data[series == stage][, valuation_l])
+#data_to_plot <- na.omit(data[series == stage][, deals_sl])
+data_to_plot <- na.omit(data[series == stage][, capital_sl])
+#data_to_plot <- na.omit(data[series == stage][, dilution_l])
+
+struct <- StructTS(data_to_plot, type = "level")
+filt <- KalmanRun(data_to_plot, struct$model)
+smoot <- tsSmooth(struct)
+
+print(struct$coef)
+print(struct$loglik)
+
+# cat("Transitional variance:", struct$coef["level"],
+# "\n", "Slope variance:", struct$coef["slope"], "\n", "Observational variance:", struct$coef["epsilon"], "\n", "Initial level of mu:", struct$model0$a[1], "\n", "Initial level of lambda:", struct$model0$a[2], "\n")
+
+plot.ts(data_to_plot)
+lines(filt$states[, 1], col = "red")
+lines(smoot[, 1], col = "blue")
+plot.ts(diff(data_to_plot))
+lines(diff(filt$states[, 1]), col = "red")
+lines(diff(c(smoot[, 1])), col = "blue")
+
+struct <- StructTS(data_to_plot, type = "trend")
+filt <- KalmanRun(data_to_plot, struct$model)
+smoot <- tsSmooth(struct)
+
+print(struct$coef)
+print(struct$loglik)
+
+# cat("Transitional variance:", struct$coef["level"],
+# "\n", "Slope variance:", struct$coef["slope"], "\n", "Observational variance:", struct$coef["epsilon"], "\n", "Initial level of mu:", struct$model0$a[1], "\n", "Initial level of lambda:", struct$model0$a[2], "\n")
+
+plot.ts(data_to_plot)
+lines(filt$states[, 1], col = "red")
+lines(smoot[, 1], col = "blue")
+plot.ts(diff(data_to_plot))
+lines(diff(filt$states[, 1]), col = "red")
+lines(diff(c(smoot[, 1])), col = "blue")
+#lines(filt$states[, 2][-1], col = "blue")
+plot.ts(filt$states[, 2], col = "red")
+lines(smoot[, 2], col = "blue")
+```
+
+```{r}
+# for (stage in unique(data$series)) {
+#   plot.ts(data[series == stage][, capital_sl])
+#   StructTS(data[series == stage][, capital_sl], type = "level") |> tsSmooth() |> lines(, col = "red")
+# }
+
+for (stage in unique(data$series)) {
+  for (i in c("deals_sl", "valuation_l", "capital_sl")) {
+    #data[, paste0(i, "c") := NULL]
+    data[series == stage, paste0(i, "c") := i |> get() |> StructTS(, type = "trend") |> tsSmooth() |> _[, 1] |> as.numeric()] # |> lines(, col = "red")
+    #data[series == stage, paste0(i, "c") := data[series == stage, c(get(paste0(i, "c")))]]
+    plot.ts(data[series == stage, ..i])
+    lines(data[series == stage, get(paste0(i, "c"))], col = "red")
+    legend("topleft", legend=c("Base", "Smoothed"), col=c("black", "red"), lty=1:1)
+  }
+}
+
+data[, valuation_lcd := valuation_lc - shift(valuation_lc, 1), by = series]
+data[, deals_slcd := deals_slc - shift(deals_slc, 1), by = series]
+data[, capital_slcd := capital_slc - shift(capital_slc, 1), by = series]
+
+# for (stage in unique(data$series)) {
+#   for (i in c("deals_slc", "valuation_lc")) {
+#     data[, !get(i)]
+#   }
+# }
+```
+
+```{r}
+plot(ks::kde(data[series == "Series A", valuation_l - valuation_lc]))
+plot(ks::kde(data[series == "Series C", deals_sl - deals_slc]))
+```
+
+```{r}
+# Gibbs Sampler for Trend Plus Noise Model
+
+library(MASS)  # For mvrnorm function
+library(MCMCpack)  # For rinvgamma function
+library(coda)  # For MCMC diagnostics
+library(statmod)
+
+# Helper function to handle different versions of rinvgamma
+safe_rinvgamma <- function(n, shape, rate) {
+  tryCatch({
+    return(rinvgamma(n, shape = shape, rate = rate))
+  }, error = function(e) {
+    tryCatch({
+      return(rinvgamma(n, shape = shape, scale = 1/rate))
+    }, error = function(e) {
+      stop("Unable to sample from inverse gamma distribution. Please check your MCMCpack version.")
+    })
+  })
+}
+
+# Helper function for stable matrix inversion
+stable_inverse <- function(mat, epsilon = 1e-6) {
+  eigendecomp <- eigen(mat)
+  values <- eigendecomp$values
+  vectors <- eigendecomp$vectors
+  
+  # Add small constant to zero or negative eigenvalues
+  values[values < epsilon] <- epsilon
+  
+  # Reconstruct the inverse
+  return(vectors %*% diag(1/values) %*% t(vectors))
+}
+
+# Custom Inverse Gaussian sampling function
+rinvgauss <- function(n, mu, lambda) {
+  v <- rnorm(n)^2
+  y <- mu + (mu^2 * v) / (2 * lambda) - 
+    (mu / (2 * lambda)) * sqrt(4 * mu * lambda * v + mu^2 * v^2)
+  u <- runif(n)
+  x <- mu^2 / y
+  ifelse(u <= mu / (mu + y), y, x)
+}
+
+gibbs_sampler_trend_plus_noise <- function(y, k = 2, n_iter = 10000, burnin = 5000, 
+                                           a = 1, b = 1, # More informative prior on xi
+                                           lambda0 = 4000, # Reduced from 4000
+                                           r_g = 0.0075, delta_g = 2.25) { # Adjusted hyperparameters
+  T <- length(y)
+  
+  # Initialize parameters
+  g <- y
+  sigma2 <- var(diff(y, differences = k))
+  lambda_g <- 1
+  xi <- 0.1  # Start with a lower initial value
+  theta <- rbinom(T-k, 1, 0.5)  # Start with sparser initialization
+  omega <- rep(1, T-k)
+  
+  # Create k-th order difference matrix
+  D_k <- diff(diag(T), differences = k)
+  
+  # Storage for posterior samples
+  posterior_samples <- list(
+    g = matrix(0, nrow = n_iter - burnin, ncol = T),
+    sigma2 = numeric(n_iter - burnin),
+    lambda_g = numeric(n_iter - burnin),
+    xi = numeric(n_iter - burnin),
+    theta = matrix(0, nrow = n_iter - burnin, ncol = T-k)
+  )
+  
+  for (iter in 1:n_iter) {
+    # Step 1: Draw lambda_g
+    S <- sum(theta)
+    lambda_g <- rgamma(1, shape = S + r_g, rate = delta_g + sum(theta * abs(D_k %*% g) / sqrt(sigma2)))
+    
+    # Step 2: Draw sigma2
+    #Omega_inv <- diag(1/omega)
+    Sigma_g_inv <- t(D_k) %*% diag(omega) %*% D_k
+    sigma2 <- 1 / rgamma(1, shape = T - k/2, rate = 0.5 * (sum((y - g)^2) + t(g) %*% Sigma_g_inv %*% g))
+    
+    # Step 3: Draw g
+    V_g <- solve(diag(T) + Sigma_g_inv)
+    V_g <- (V_g + t(V_g)) / 2  # Ensure V_g is symmetric
+    
+    # Check if V_g is positive definite and adjust iteratively if not
+    while (!matrixcalc::is.positive.definite(V_g)) {
+      V_g <- V_g + diag(1e-6, T)  # Adjust slightly to make it positive definite
+      V_g <- (V_g + t(V_g)) / 2  # Ensure V_g is symmetric
+    }
+    
+    mu_g <- V_g %*% y
+    g <- mvrnorm(1, mu = mu_g, Sigma = sigma2 * V_g)
+    
+    # Step 4: Draw xi
+    xi <- rbeta(1, S + a, T - k - S + b)
+    
+    # Step 5: Draw theta
+    D_k_g <- D_k %*% g
+    log_p0 <- log(1 - xi) + log(lambda0) - sqrt(lambda0^2 * D_k_g^2 / sigma2)
+    log_p1 <- log(xi) + log(lambda_g) - sqrt(lambda_g^2 * D_k_g^2 / sigma2)
+    p <- 1 / (1 + exp(log_p0 - log_p1))
+    theta <- rbinom(T-k, 1, p)
+    
+    # Step 6: Draw omega
+    lambda_theta <- (1 - theta) * lambda0^2 + theta * lambda_g^2
+    mu_omega <- sqrt(lambda_theta * sigma2 / D_k_g^2)
+    omega <- rinvgauss(T-k, mu = mu_omega, lambda = lambda_theta)
+    
+    # Ensure omega is a vector
+    omega <- as.vector(omega)
+    
+    # Store posterior samples after burn-in
+    if (iter > burnin) {
+      posterior_samples$g[iter - burnin, ] <- g
+      posterior_samples$sigma2[iter - burnin] <- sigma2
+      posterior_samples$lambda_g[iter - burnin] <- lambda_g
+      posterior_samples$xi[iter - burnin] <- xi
+      posterior_samples$theta[iter - burnin, ] <- theta
+    }
+    
+    # Print progress
+    if (iter %% 1000 == 0) {
+      cat("Iteration", iter, "of", n_iter, "\n")
+      cat("Current xi:", xi, "\n")
+      cat("Proportion of theta = 1:", mean(theta), "\n\n")
+    }
+  }
+  
+  return(posterior_samples)
+}
+
+# Function to safely create mcmc object
+safe_mcmc <- function(x) {
+  if (is.null(x) || length(x) == 0 || !is.numeric(x)) {
+    return(NULL)
+  }
+  if (is.vector(x)) {
+    return(mcmc(as.matrix(x)))
+  }
+  return(mcmc(x))
+}
+
+# Updated function for trace diagnostics
+trace_diagnostics <- function(results, parameter) {
+  # Check if the parameter exists in results
+  if (!(parameter %in% names(results))) {
+    return(list(error = paste("Parameter", parameter, "not found in results")))
+  }
+  
+  # Check the structure of the parameter
+  param_data <- results[[parameter]]
+  param_info <- list(
+    type = class(param_data),
+    dimension = dim(param_data),
+    length = length(param_data),
+    is_numeric = is.numeric(param_data)
+  )
+  
+  # If the parameter is empty or not numeric, return the info without further processing
+  if (length(param_data) == 0 || !is.numeric(param_data)) {
+    return(list(error = paste("Parameter", parameter, "is empty or not numeric"), info = param_info))
+  }
+  
+  if (parameter == "g") {
+    # For g, we'll analyze the mean and a few quantiles
+    g_mean <- rowMeans(param_data)
+    g_quantiles <- apply(param_data, 1, quantile, probs = c(0.25, 0.5, 0.75))
+    mcmc_obj <- safe_mcmc(cbind(g_mean, t(g_quantiles)))
+    if (is.null(mcmc_obj)) {
+      return(list(error = paste("Failed to create MCMC object for", parameter), info = param_info))
+    }
+    colnames(mcmc_obj) <- c("mean", "25%", "median", "75%")
+  } else {
+    mcmc_obj <- safe_mcmc(param_data)
+    if (is.null(mcmc_obj)) {
+      return(list(error = paste("Failed to create MCMC object for", parameter), info = param_info))
+    }
+  }
+  
+  # Basic summary
+  summary_stats <- summary(mcmc_obj)
+  
+  # Gelman-Rubin diagnostic (assumes single chain, so uses half-chains)
+  n <- nrow(mcmc_obj)
+  gelman_diag <- if (n >= 4) {  # Minimum 4 samples required for meaningful split
+    tryCatch({
+      half1 <- mcmc(mcmc_obj[1:(n/2),])
+      half2 <- mcmc(mcmc_obj[(n/2+1):n,])
+      gelman.diag(mcmc.list(half1, half2))
+    }, error = function(e) {
+      list(error = paste("Error in Gelman-Rubin diagnostic:", e$message),
+           details = list(n_samples = n, n_variables = ncol(mcmc_obj)))
+    })
+  } else {
+    list(error = "Not enough samples for Gelman-Rubin diagnostic",
+         details = list(n_samples = n, n_variables = ncol(mcmc_obj)))
+  }
+  
+  # Effective sample size
+  ess <- effectiveSize(mcmc_obj)
+  
+  # Geweke diagnostic
+  geweke_diag <- tryCatch({
+    geweke.diag(mcmc_obj)
+  }, error = function(e) {
+    list(error = paste("Error in Geweke diagnostic:", e$message),
+         details = list(n_samples = n, n_variables = ncol(mcmc_obj)))
+  })
+  
+  diagnostics <- list(
+    info = param_info,
+    summary = summary_stats,
+    gelman_rubin = gelman_diag,
+    effective_sample_size = ess,
+    geweke = geweke_diag
+  )
+  
+  return(diagnostics)
+}
+
+# Function to run diagnostics for all parameters
+run_all_diagnostics <- function(results) {
+  parameters <- names(results)
+  diagnostics <- lapply(parameters, function(param) {
+    diag <- trace_diagnostics(results, param)
+    if ("error" %in% names(diag)) {
+      message(paste("Error in parameter", param, ":", diag$error))
+    }
+    diag
+  })
+  names(diagnostics) <- parameters
+  
+  return(diagnostics)
+}
+
+# Updated function to plot diagnostics for a specific parameter
+plot_parameter_diagnostics <- function(results, parameter) {
+  diag <- trace_diagnostics(results, parameter)
+  if ("error" %in% names(diag)) {
+    message(paste("Error in parameter", parameter, ":", diag$error))
+    return(invisible(NULL))
+  }
+  
+  if (parameter == "theta") {
+    # Special handling for theta
+    theta_data <- results[[parameter]]
+    if (is.matrix(theta_data)) {
+      # If theta is a matrix, plot summary statistics
+      theta_mean <- colMeans(theta_data)
+      theta_sd <- apply(theta_data, 2, sd)
+      
+      par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+      plot(theta_mean, type = 'l', main = "Mean of theta", ylab = "Mean", xlab = "Index")
+      plot(theta_sd, type = 'l', main = "SD of theta", ylab = "SD", xlab = "Index")
+      hist(theta_mean, main = "Histogram of theta means", xlab = "Mean")
+      acf(theta_mean, main = "ACF of theta means")
+    } else {
+      # If theta is a vector, treat it like other parameters
+      mcmc_obj <- safe_mcmc(theta_data)
+      if (is.null(mcmc_obj)) {
+        message(paste("Unable to create MCMC object for", parameter))
+        return(invisible(NULL))
+      }
+      par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+      plot(mcmc_obj, main = paste("Trace of", parameter))
+      autocorr.plot(mcmc_obj, main = paste("Autocorrelation of", parameter))
+      densplot(mcmc_obj, main = paste("Density of", parameter))
+    }
+  } else {
+    # For other parameters
+    mcmc_obj <- if (parameter == "g") {
+      safe_mcmc(cbind(rowMeans(results[[parameter]]), t(apply(results[[parameter]], 1, quantile, probs = c(0.25, 0.5, 0.75)))))
+    } else {
+      safe_mcmc(results[[parameter]])
+    }
+    
+    if (is.null(mcmc_obj)) {
+      message(paste("Unable to create MCMC object for", parameter))
+      return(invisible(NULL))
+    }
+    
+    par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+    tryCatch({
+      plot(mcmc_obj, main = paste("Trace of", parameter))
+      autocorr.plot(mcmc_obj, main = paste("Autocorrelation of", parameter))
+      densplot(mcmc_obj, main = paste("Density of", parameter))
+    }, error = function(e) {
+      message(paste("Error in plotting:", e$message))
+    })
+  }
+  par(mfrow = c(1, 1))  # Reset plot layout
+}
+
+# Function to run diagnostics for all parameters
+run_all_diagnostics <- function(results) {
+  parameters <- names(results)
+  diagnostics <- lapply(parameters, function(param) {
+    diag <- trace_diagnostics(results, param)
+    if ("error" %in% names(diag)) {
+      message(paste("Error in parameter", param, ":", diag$error))
+    }
+    diag
+  })
+  names(diagnostics) <- parameters
+  
+  return(diagnostics)
+}
+```
+
+```{r}
+y <- na.omit(data[series == "Seed", deals_sl])
+
+results <- gibbs_sampler_trend_plus_noise(y, n_iter = 100000, burnin = 50000, r_g = 0.0075, delta_g = 2.25, lambda0 = 4000, a = 1, b = 1)
+all_diagnostics <- run_all_diagnostics(results)
+```
+
+```{r}
+#all_diagnostics <- run_all_diagnostics(results)
+#print(all_diagnostics$sigma2$summary)
+print(all_diagnostics$sigma2$gelman_rubin)
+print(all_diagnostics$xi$gelman_rubin)
+print(all_diagnostics$theta$gelman_rubin)
+print(all_diagnostics$lambda_g$gelman_rubin)
+```
+
+```{r}
+plot_parameter_diagnostics(results, "xi")
+plot_parameter_diagnostics(results, "theta")
+plot_parameter_diagnostics(results, "lambda_g")
+plot_parameter_diagnostics(results, "sigma2")
+```
+
+```{r}
+plot(y, type = "l")
+lines(matrixStats::colMedians(results$g), col = "red", lwd = 2)
+
+plot(y - matrixStats::colMedians(results$g), type = "l")
+
+plot(diff(y), type = "l")
+lines(diff(matrixStats::colMedians(results$g)), col = "red", lwd = 2)
+```
+
+```{r}
+seed_model <- feols(f(valuation_lc, 0:12) ~ l(shocks, 0) + l(valuation_lc, 0:4) + l(deals_slc, 0:4) + l(capital_sll, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Seed"], panel = ~series + period, vcov = "hetero")
+seed_irf <- coef(seed_model)[, 3] / coef_first_stage
+seed_se <- se(seed_model)[, 3] / coef_first_stage
+
+ab_model <- feols(f(valuation_lc, 0:12) ~ l(shocks, 0) + l(valuation_lc, 0:4) + l(deals_slc, 0:4) + l(capital_sll, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Series A" | series == "Series B"], panel = ~series + period, vcov = "hetero")
+ab_irf <- coef(ab_model)[, 3] / coef_first_stage
+ab_se <- se(ab_model)[, 3] / coef_first_stage
+
+cd_model <- feols(f(valuation_lc, 0:12) ~ l(shocks, 0) + l(valuation_lc, 0:4) + l(deals_slc, 0:4) + l(capital_sll, 0:4) | series, data = data[as.numeric(t) <= 40][series == "Series C" | series == "Series D"], panel = ~series + period, vcov = "hetero")
+cd_irf <- coef(cd_model)[, 3] / coef_first_stage
+cd_se <- se(cd_model)[, 3] / coef_first_stage
+
+ggplot() +
+  geom_line(aes(x=0:12, y=seed_irf, color = "Seed"), linewidth = 1) +
+  geom_line(aes(x=0:12, y=ab_irf, color = "Series A / B"), linewidth = 1) +
+  geom_line(aes(x=0:12, y=cd_irf, color = "Series C / D"), linewidth = 1) +
+  geom_ribbon(aes(x=0:12, ymin=seed_irf - seed_se, ymax=seed_irf + seed_se, fill = "Seed"), alpha = 0.2) +
+  geom_ribbon(aes(x=0:12, ymin=ab_irf - ab_se, ymax=ab_irf + ab_se, fill = "Series A / B"), alpha = 0.2) +
+  geom_ribbon(aes(x=0:12, ymin=cd_irf - cd_se, ymax=cd_irf + cd_se, fill = "Series C / D"), alpha = 0.2) +
+  scale_x_continuous(breaks=0:12, expand = c(0, 0)) +
+  scale_y_continuous(
+    labels = scales::percent_format(scale = 100),
+    breaks = seq(-0.3, 0.1, 0.1),
+    expand = c(0, 0)
+  ) +
+  coord_cartesian(
+    ylim = c(-0.3, 0.1)
+  ) +
+  #scale_color_manual(values = c("Seed" = scheme[1], "Series A / B" = scheme[2], "Series C / D" = scheme[3])) +
+  #scale_fill_manual(values = c("Seed" = scheme[1], "Series A / B" = scheme[2], "Series C / D" = scheme[3])) +
+  guides(fill = FALSE) +
+  labs(
+    title = "Surprise Surprise",
+    subtitle = "Valuation Effect of 100 bps Unexpected Increase in 1YR U.S. Treasury Rate",
+    caption  = "Source: Pitchbook | whoisnnamdi.com | @whoisnnamdi",
+    x = "Quarters",
+    y = "% Change"
+  ) +
+  theme_whoisnnamdi +
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.125, 0.2),
+  )
+```
