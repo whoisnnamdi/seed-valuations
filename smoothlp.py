@@ -120,13 +120,10 @@ def lproj(
         h_range = np.arange(h1, H + 1).reshape(-1, 1)
         bdeg = 3
         basis = bspline(h_range, h1, H + 1, H + 1, bdeg)[:, :-1]
-    #print(basis.shape)
     if w is not None:
         w = np.hstack([np.ones((t, 1)), w])
     else:
         w = np.ones((t, 1))
-    
-    #delta = np.std(x)
 
     hr = int(H + 1 - h1)
     ts = t * hr
@@ -152,12 +149,7 @@ def lproj(
 
         y_range = np.arange(i + h1, min(i + H + 1, t))
 
-        # if i == 0:
-        #     y_lag = np.nan
-        # else:
-        #     y_lag = y[i - 1]
         _y[idx_beg:idx_end, 0] = np.append(y[y_range], np.full((hr - len(y_range)), np.nan))
-        #print(y_lag)
 
         if style == "reg":
             _xb[idx_beg:idx_end, :] = np.eye(hr) * x[i]
@@ -179,8 +171,6 @@ def lproj(
     xx = np.dot(_x.T, _x)
     xy = np.dot(_x.T, _y)
     p = np.zeros((_x.shape[1], _x.shape[1]))
-    #print(xx)
-
     if style == "smooth":
         D = np.eye(xs)
 
@@ -249,8 +239,6 @@ def lproj_cv(obj: dict, K: int) -> dict:
     ll = len(obj["lam"])
     ind = np.ceil(obj["idx"][:, 0] / t * K).astype(int)
     rss = np.zeros(ll)
-    #print(ind)
-
     for i in range(ll):
         rss_l = np.zeros(K)
 
@@ -262,11 +250,8 @@ def lproj_cv(obj: dict, K: int) -> dict:
             a = np.dot(x_in.T, x_in) + obj["lam"][i] * obj["ts"] * ((K - 1) / K) * obj["p"]
             b = np.dot(x_in.T, y_in)
             beta = np.linalg.solve(a, b)
-            #print(obj["_y"][ind == j])
             rss_l[j] = np.mean((y_out - np.dot(x_out, beta)) ** 2)
-            #print(rss_l[j])
 
-        #print(rss_l[0])
         rss[i] = np.nanmean(rss_l)
     
     return {
