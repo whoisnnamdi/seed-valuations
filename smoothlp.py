@@ -36,12 +36,19 @@ def bspline(
 def lagmat(x: np.ndarray, lag: int) -> np.ndarray:
     """Lag a matrix.
     
+    This function creates a lagged version of the input matrix.
+    
     Args:
-        x: Matrix of data.
-        lag: Lag.
+        x: Matrix of data. Can be 1D or 2D numpy array.
+        lag: Number of lags to create.
     
     Returns:
-        Lagged matrix.
+        Lagged matrix. The output will have the same number of rows as the input,
+        but with lag * k columns, where k is the number of columns in the input.
+        The first 'lag' rows will contain NaN values.
+    
+    Note:
+        If the input is a 1D array, it will be reshaped to a 2D array with one column.
     """
     assert len(x.shape) <= 2
     #assert lag > 0
@@ -69,13 +76,39 @@ def lproj(
         zero: bool=False,
         lam: list[float]=[0]
 ) -> dict:
-    """Run local projections
+    """Run local projections.
+    
+    This function performs local projections, which is a method for estimating
+    impulse response functions.
     
     Args:
-        y: Dependent variable.
-        ...
+        y: Dependent variable (1D numpy array).
+        x: Independent variable (1D numpy array).
+        w: Additional control variables (2D numpy array, optional).
+        style: Projection style, either "reg" for regular or "smooth" for smoothed (default: "reg").
+        H: Maximum horizon for projections (default: 12).
+        h1: Minimum horizon for projections (default: 0).
+        r: Order of difference for smoothing penalty (default: 0).
+        zero: Whether to impose zero constraint at the end of the horizon for smoothing (default: False).
+        lam: List of smoothing parameters (default: [0]).
+    
     Returns:
-        ...
+        A dictionary containing:
+        - _y: Stacked dependent variable.
+        - _x: Stacked independent variables.
+        - theta: Estimated coefficients.
+        - ir: Impulse responses.
+        - lam: Smoothing parameters.
+        - ts: Number of observations.
+        - p: Penalty matrix.
+        - H: Maximum horizon.
+        - h1: Minimum horizon.
+        - style: Projection style.
+        - t: Number of time periods.
+        - mul: Multipliers.
+        - basis: B-spline basis (if style is "smooth").
+        - xs: Number of coefficients.
+        - idx: Index of observations.
     """
     t = len(y)
 
@@ -196,7 +229,22 @@ def lproj(
         "idx": idx
     }
     
-def lproj_cv(obj: dict, K) -> dict:
+def lproj_cv(obj: dict, K: int) -> dict:
+    """Perform cross-validation for local projections.
+    
+    This function performs K-fold cross-validation on the local projections
+    to select the optimal smoothing parameter.
+    
+    Args:
+        obj: Dictionary containing the results from the lproj function.
+        K: Number of folds for cross-validation.
+    
+    Returns:
+        A dictionary containing:
+        - rss: Residual sum of squares for each smoothing parameter.
+        - idx_opt: Index of the optimal smoothing parameter.
+        - ir_opt: Optimal impulse response.
+    """
     t = obj["t"]
     ll = len(obj["lam"])
     ind = np.ceil(obj["idx"][:, 0] / t * K).astype(int)
@@ -227,7 +275,22 @@ def lproj_cv(obj: dict, K) -> dict:
         "ir_opt": obj["ir"][:, np.argmin(rss)]
     }
 
-def lproj_conf(obj: dict, lam=0) -> dict:
+def lproj_conf(obj: dict, lam: int = 0) -> dict:
+    """Calculate confidence intervals for local projections.
+    
+    This function computes confidence intervals for the impulse responses
+    estimated by the local projections method.
+    
+    Args:
+        obj: Dictionary containing the results from the lproj function.
+        lam: Index of the smoothing parameter to use (default: 0).
+    
+    Returns:
+        A dictionary containing:
+        - se: Standard errors of the impulse responses.
+        - conf: 80% confidence intervals for the impulse responses.
+        - irc: Confidence intervals including NaN values for periods before h1.
+    """
     import scipy.stats as stats
 
     u = obj["_y"] - np.dot(obj["_x"], obj["theta"][:, lam].reshape(-1, 1))
